@@ -109,6 +109,79 @@ public extension FileSystemError {
             self.init(.ioError(code: errno), path)
         }
     }
+
+    init(error: POSIXError, _ path: AbsolutePath) {
+        switch error.code {
+        case .ENOENT:
+            self.init(.noEntry, path)
+        case .EACCES:
+            self.init(.invalidAccess, path)
+        case .EISDIR:
+            self.init(.isDirectory, path)
+        case .ENOTDIR:
+            self.init(.notDirectory, path)
+        case .EEXIST:
+            self.init(.alreadyExistsAtDestination, path)
+        default:
+            self.init(.ioError(code: error.code.rawValue), path)
+        }
+    }
+}
+
+// MARK: - NSError to FileSystemError Mapping
+private extension FileSystemError {
+    /// Maps NSError codes to appropriate FileSystemError kinds
+    /// This centralizes error mapping logic and ensures consistency across file operations
+    ///
+    /// - Parameters:
+    ///   - error: The NSError to map
+    ///   - path: The file path associated with the error
+    /// - Returns: A FileSystemError with appropriate semantic mapping
+    static func from(nsError error: NSError, path: AbsolutePath) -> FileSystemError {
+        // First, check for POSIX errors in the underlying error chain
+        // POSIX errors provide more precise semantic information
+        if let posixError = error.userInfo[NSUnderlyingErrorKey] as? POSIXError {
+            return FileSystemError(error: posixError, path)
+        }
+        
+        // Handle Cocoa domain errors with proper semantic mapping
+        guard error.domain == NSCocoaErrorDomain else {
+            // For non-Cocoa errors, preserve the original error information
+            return FileSystemError(.ioError(code: Int32(error.code)), path)
+        }
+        
+        // Map common Cocoa error codes to semantic FileSystemError kinds
+        switch error.code {
+        // File not found errors
+        case NSFileReadNoSuchFileError, NSFileNoSuchFileError:
+            return FileSystemError(.noEntry, path)
+            
+        // Permission denied errors
+        case NSFileReadNoPermissionError, NSFileWriteNoPermissionError:
+            return FileSystemError(.invalidAccess, path)
+            
+        // File already exists errors
+        case NSFileWriteFileExistsError:
+            return FileSystemError(.alreadyExistsAtDestination, path)
+            
+        // Read-only volume errors
+        case NSFileWriteVolumeReadOnlyError:
+            return FileSystemError(.invalidAccess, path)
+            
+        // File corruption or invalid format errors
+        case NSFileReadCorruptFileError:
+            return FileSystemError(.ioError(code: Int32(error.code)), path)
+            
+        // Directory-related errors
+        case NSFileReadInvalidFileNameError:
+            return FileSystemError(.notDirectory, path)
+            
+        default:
+            // For any other Cocoa error, wrap it as an IO error preserving the original code
+            // This ensures we don't lose diagnostic information
+            return FileSystemError(.ioError(code: Int32(error.code)), path)
+        }
+    }
 }
 
 /// Defines the file modes.
@@ -513,64 +586,45 @@ private struct LocalFileSystem: FileSystem {
     }
 
     func readFileContents(_ path: AbsolutePath) throws -> ByteString {
-        // Open the file.
-        guard let fp = fopen(path.pathString, "rb") else {
-            throw FileSystemError(errno: errno, path)
-        }
-        defer { fclose(fp) }
-
-        // Read the data one block at a time.
-        let data = BufferedOutputByteStream()
-        var tmpBuffer = [UInt8](repeating: 0, count: 1 << 12)
-        while true {
-            let n = fread(&tmpBuffer, 1, tmpBuffer.count, fp)
-            if n < 0 {
-                if errno == EINTR { continue }
-                throw FileSystemError(.ioError(code: errno), path)
+        do {
+            let dataContent = try Data(contentsOf: URL(fileURLWithPath: path.pathString))
+            return dataContent.withUnsafeBytes { bytes in
+                ByteString(Array(bytes.bindMemory(to: UInt8.self)))
             }
-            if n == 0 {
-                let errno = ferror(fp)
-                if errno != 0 {
-                    throw FileSystemError(.ioError(code: errno), path)
-                }
-                break
-            }
-            data.send(tmpBuffer[0..<n])
+        } catch let error as NSError {
+            throw FileSystemError.from(nsError: error, path: path)
+        } catch {
+            // Handle any other error types (e.g., Swift errors)
+            throw FileSystemError(.unknownOSError, path)
         }
-
-        return data.bytes
     }
 
     func writeFileContents(_ path: AbsolutePath, bytes: ByteString) throws {
-        // Open the file.
-        guard let fp = fopen(path.pathString, "wb") else {
-            throw FileSystemError(errno: errno, path)
-        }
-        defer { fclose(fp) }
-
-        // Write the data in one chunk.
-        var contents = bytes.contents
-        while true {
-            let n = fwrite(&contents, 1, contents.count, fp)
-            if n < 0 {
-                if errno == EINTR { continue }
-                throw FileSystemError(.ioError(code: errno), path)
+        do {
+            try bytes.withData {
+                try $0.write(to: URL(fileURLWithPath: path.pathString))
             }
-            if n != contents.count {
-                throw FileSystemError(.mismatchedByteCount(expected: contents.count, actual: n), path)
-            }
-            break
+        } catch let error as NSError {
+            throw FileSystemError.from(nsError: error, path: path)
+        } catch {
+            // Handle any other error types (e.g., Swift errors)
+            throw FileSystemError(.unknownOSError, path)
         }
     }
 
     func writeFileContents(_ path: AbsolutePath, bytes: ByteString, atomically: Bool) throws {
-        // Perform non-atomic writes using the fast path.
         if !atomically {
             return try writeFileContents(path, bytes: bytes)
         }
-
-        try bytes.withData {
-            try $0.write(to: URL(fileURLWithPath: path.pathString), options: .atomic)
+        do {
+            try bytes.withData {
+                try $0.write(to: URL(fileURLWithPath: path.pathString), options: .atomic)
+            }
+        } catch let error as NSError {
+            throw FileSystemError.from(nsError: error, path: path)
+        } catch {
+            // Handle any other error types (e.g., Swift errors)
+            throw FileSystemError(.unknownOSError, path)
         }
     }
 
