@@ -515,13 +515,25 @@ private struct WindowsPath: Path, Sendable {
     }
 
     init(string: String) {
+        var path: String
         if string.first?.isASCII ?? false, string.first?.isLetter ?? false, string.first?.isLowercase ?? false,
            string.count > 1, string[string.index(string.startIndex, offsetBy: 1)] == ":"
         {
-            self.string = "\(string.first!.uppercased())\(string.dropFirst(1))"
+            path = "\(string.first!.uppercased())\(string.dropFirst(1))"
         } else {
-            self.string = string
+            path = string
         }
+        // There seems to be many assumptions around paths and trailing '\'  
+        var substring = path[path.startIndex..<path.endIndex]
+        while !substring.isEmpty && substring.utf8.last == UInt8(ascii: "\\") {
+            substring = substring.dropLast()
+        }
+        if !substring.isEmpty && substring.last != ":" {
+            // Drop the trailing '\', unless the string path only
+            // has '\', and unless the slashes are right after the drive letter.
+            path = String(substring)
+        }
+        self.string = path
     }
 
     private static func repr(_ path: String) -> String {
@@ -568,6 +580,7 @@ private struct WindowsPath: Path, Sendable {
         _ = string.withCString(encodedAs: UTF16.self) { root in
             name.withCString(encodedAs: UTF16.self) { path in
                 PathAllocCombine(root, path, ULONG(PATHCCH_ALLOW_LONG_PATHS.rawValue), &result)
+                _ = PathCchStripPrefix(result, wcslen(result))      
             }
         }
         defer { LocalFree(result) }
@@ -579,6 +592,7 @@ private struct WindowsPath: Path, Sendable {
         _ = string.withCString(encodedAs: UTF16.self) { root in
             relativePath.string.withCString(encodedAs: UTF16.self) { path in
                 PathAllocCombine(root, path, ULONG(PATHCCH_ALLOW_LONG_PATHS.rawValue), &result)
+                _ = PathCchStripPrefix(result, wcslen(result))      
             }
         }
         defer { LocalFree(result) }
@@ -965,8 +979,7 @@ extension AbsolutePath {
                 preconditionFailure("invalid relative path computed from \(pathString)")
             }
         }
-
-        assert(AbsolutePath(base, result) == self)
+        assert(AbsolutePath(base, result) == self, "\(AbsolutePath(base, result)) != \(self)")
         return result
     }
 
